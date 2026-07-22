@@ -5,4 +5,4 @@ compatibility_date = "2024-11-01"
 [[d1_databases]]
 binding = "DB"               # 在代码中通过 env.DB 访问
 database_name = "chat_db"
-database_id = "your-database-id" # 部署时会自动生成，先留空
+database_id = "7874b9e4-930b-4f53-9cae-d46c0b97f49e" # 部署时会自动生成，先留空
