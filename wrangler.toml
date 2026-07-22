@@ -1,0 +1,8 @@
+name = "chat-server"
+main = "src/worker.js"
+compatibility_date = "2024-11-01"
+
+[[d1_databases]]
+binding = "DB"               # 在代码中通过 env.DB 访问
+database_name = "chat_db"
+database_id = "your-database-id" # 部署时会自动生成，先留空
