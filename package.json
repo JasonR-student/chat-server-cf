@@ -1,0 +1,13 @@
+{
+  "name": "chat-server-cf",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "client": "node terminal-client.mjs",
+    "test": "node --test --test-isolation=none"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

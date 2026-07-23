@@ -1,60 +1,82 @@
-// src/worker.js - 云原生聊天转发服务（Node.js 风格）
+// src/worker.js - 基于 Durable Objects 的共享聊天服务
 
-// 全局内存缓存（在线用户 WebSocket 连接）
-// 注意：实际生产中多机房可用 Durable Objects，这里先做单机测试
-const onlineUsers = new Map(); // { username: WebSocket }
+export class ChatRoom {
+    constructor(state, env) {
+        this.state = state;
+        this.env = env;
+        this.onlineUsers = new Map();
+    }
 
-export default {
-    async fetch(request, env, ctx) {
-        // 1. 只处理 WebSocket 升级请求
+    async fetch(request) {
         const upgradeHeader = request.headers.get('Upgrade');
-        if (upgradeHeader !== 'websocket') {
-            return new Response('此路径仅接受 WebSocket 连接', { status: 400 });
+        if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
+            return new Response('仅支持 WebSocket', { status: 400 });
         }
 
-        // 2. 创建 WebSocket 对
         const [client, server] = Object.values(new WebSocketPair());
         server.accept();
 
-        // ============== 核心业务逻辑 ==============
-        let currentUser = null; // 当前连接的用户名
+        let currentUser = null;
 
-        // 辅助：生成唯一消息 ID
-        function generateMsgId() {
-            return Date.now() + '_' + Math.random().toString(36).substring(2, 6);
-        }
-
-        // 辅助：向客户端发送 JSON
-        function sendJSON(ws, data) {
+        const sendJSON = (ws, data) => {
             if (ws && ws.readyState === 1) {
                 ws.send(JSON.stringify(data));
             }
-        }
+        };
 
-        // ===== 接收客户端消息 =====
+        const sendError = (code, message) => {
+            sendJSON(server, { type: 'error', code, message });
+        };
+
         server.addEventListener('message', async (event) => {
+            let packet;
             try {
-                const packet = JSON.parse(event.data);
+                packet = JSON.parse(event.data);
+            } catch {
+                sendError('INVALID_JSON', '消息必须是有效的 JSON');
+                return;
+            }
+
+            console.log('收到消息:', packet.type);
+
+            try {
                 const { type, username, target, content } = packet;
 
-                // --- 1. 注册/上线 ---
-                if (type === 'register') {
-                    currentUser = username;
-                    // 踢掉旧的同名连接
-                    if (onlineUsers.has(username)) {
-                        const old = onlineUsers.get(username);
-                        if (old !== server) old.close();
-                    }
-                    onlineUsers.set(username, server);
-                    console.log(`[上线] ${username}`);
+                if (type === 'ping') {
+                    sendJSON(server, { type: 'pong' });
+                    return;
+                }
 
-                    // 从 D1 数据库拉取离线消息
-                    const { results } = await env.DB.prepare(
-                        `SELECT sender, content, msg_id FROM offline_msgs WHERE receiver = ?`
-                    ).bind(username).all();
+                if (type === 'register') {
+                    const normalizedUsername = typeof username === 'string' ? username.trim() : '';
+                    if (!normalizedUsername) {
+                        sendError('INVALID_USERNAME', '用户名不能为空');
+                        return;
+                    }
+
+                    if (
+                        currentUser &&
+                        currentUser !== normalizedUsername &&
+                        this.onlineUsers.get(currentUser) === server
+                    ) {
+                        this.onlineUsers.delete(currentUser);
+                    }
+
+                    const oldWs = this.onlineUsers.get(normalizedUsername);
+                    if (oldWs && oldWs !== server) {
+                        oldWs.close(1000, '该用户名已在其他客户端登录');
+                    }
+
+                    currentUser = normalizedUsername;
+                    this.onlineUsers.set(normalizedUsername, server);
+                    sendJSON(server, { type: 'registered', username: normalizedUsername });
+                    console.log(`[上线] ${normalizedUsername}`);
+
+                    const { results } = await this.env.DB.prepare(
+                        'SELECT sender, content, msg_id FROM offline_msgs WHERE receiver = ?'
+                    ).bind(normalizedUsername).all();
 
                     for (const row of results) {
-                        // 推送离线消息给当前上线的用户
                         sendJSON(server, {
                             type: 'message',
                             from: row.sender,
@@ -63,97 +85,109 @@ export default {
                             isOffline: true
                         });
 
-                        // 检查发送方是否在线，产生“已送达”回执
-                        const senderWs = onlineUsers.get(row.sender);
+                        const senderWs = this.onlineUsers.get(row.sender);
                         if (senderWs) {
                             sendJSON(senderWs, {
                                 type: 'receipt',
                                 status: 'DELIVERED',
                                 msgId: row.msg_id,
-                                target: username
+                                target: normalizedUsername
                             });
                         } else {
-                            // 发送方不在线，将回执存入 D1
-                            await env.DB.prepare(
-                                `INSERT INTO receipt_queue (sender, msg_id, receiver) VALUES (?, ?, ?)`
-                            ).bind(row.sender, row.msg_id, username).run();
+                            await this.env.DB.prepare(
+                                'INSERT INTO receipt_queue (sender, msg_id, receiver) VALUES (?, ?, ?)'
+                            ).bind(row.sender, row.msg_id, normalizedUsername).run();
                         }
                     }
 
-                    // 删除已推送的离线消息
-                    await env.DB.prepare(
-                        `DELETE FROM offline_msgs WHERE receiver = ?`
-                    ).bind(username).run();
+                    await this.env.DB.prepare(
+                        'DELETE FROM offline_msgs WHERE receiver = ?'
+                    ).bind(normalizedUsername).run();
 
-                    // 推送历史未读回执（当发送方之前离线，现在上线时）
-                    const receiptRows = await env.DB.prepare(
-                        `SELECT receiver, msg_id FROM receipt_queue WHERE sender = ?`
-                    ).bind(username).all();
+                    const { results: receiptRows } = await this.env.DB.prepare(
+                        'SELECT receiver, msg_id FROM receipt_queue WHERE sender = ?'
+                    ).bind(normalizedUsername).all();
 
-                    for (const r of receiptRows) {
-                        sendJSON(server, {
-                            type: 'receipt',
-                            status: 'PENDING',
-                            msg: `您发给 ${r.receiver} 的消息已成功送达 (ID:${r.msg_id})`
-                        });
-                    }
-                    // 清空回执队列
-                    await env.DB.prepare(
-                        `DELETE FROM receipt_queue WHERE sender = ?`
-                    ).bind(username).run();
-                }
-
-                // --- 2. 发送消息（A -> B） ---
-                if (type === 'message') {
-                    const sender = currentUser;
-                    if (!sender) return;
-                    const msgId = generateMsgId();
-
-                    const targetWs = onlineUsers.get(target);
-                    if (targetWs) {
-                        // B 在线：直接转发
-                        sendJSON(targetWs, {
-                            type: 'message',
-                            from: sender,
-                            content: content,
-                            msgId: msgId,
-                            isOffline: false
-                        });
-                        // 给 A 回执：已送达
+                    for (const receipt of receiptRows) {
                         sendJSON(server, {
                             type: 'receipt',
                             status: 'DELIVERED',
-                            msgId: msgId,
-                            target: target
+                            msgId: receipt.msg_id,
+                            target: receipt.receiver
+                        });
+                    }
+
+                    await this.env.DB.prepare(
+                        'DELETE FROM receipt_queue WHERE sender = ?'
+                    ).bind(normalizedUsername).run();
+                    return;
+                }
+
+                if (type === 'message') {
+                    if (!currentUser) {
+                        sendError('NOT_REGISTERED', '请先注册用户名');
+                        return;
+                    }
+
+                    const normalizedTarget = typeof target === 'string' ? target.trim() : '';
+                    const normalizedContent = typeof content === 'string' ? content.trim() : '';
+                    if (!normalizedTarget || !normalizedContent) {
+                        sendError('INVALID_MESSAGE', '目标用户和消息内容不能为空');
+                        return;
+                    }
+
+                    const msgId = `${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+                    const targetWs = this.onlineUsers.get(normalizedTarget);
+
+                    if (targetWs) {
+                        sendJSON(targetWs, {
+                            type: 'message',
+                            from: currentUser,
+                            content: normalizedContent,
+                            msgId,
+                            isOffline: false
+                        });
+                        sendJSON(server, {
+                            type: 'receipt',
+                            status: 'DELIVERED',
+                            msgId,
+                            target: normalizedTarget
                         });
                     } else {
-                        // B 离线：存入 D1 离线消息表
-                        await env.DB.prepare(
-                            `INSERT INTO offline_msgs (receiver, sender, content, msg_id) VALUES (?, ?, ?, ?)`
-                        ).bind(target, sender, content, msgId).run();
-
-                        // 给 A 回执：已暂存
+                        await this.env.DB.prepare(
+                            'INSERT INTO offline_msgs (receiver, sender, content, msg_id) VALUES (?, ?, ?, ?)'
+                        ).bind(normalizedTarget, currentUser, normalizedContent, msgId).run();
                         sendJSON(server, {
                             type: 'receipt',
                             status: 'STORED',
-                            msgId: msgId,
-                            target: target
+                            msgId,
+                            target: normalizedTarget
                         });
                     }
+                    return;
                 }
-            } catch (e) {
-                console.error('解析错误:', e);
+
+                sendError('UNKNOWN_TYPE', '不支持的消息类型');
+            } catch (error) {
+                console.error('处理消息失败:', error);
+                sendError('SERVER_ERROR', '服务器处理消息失败');
             }
         });
 
-        // ===== 连接断开 =====
         server.addEventListener('close', () => {
-            if (currentUser) {
-                onlineUsers.delete(currentUser);
+            if (currentUser && this.onlineUsers.get(currentUser) === server) {
+                this.onlineUsers.delete(currentUser);
                 console.log(`[下线] ${currentUser}`);
             }
         });
 
         return new Response(null, { status: 101, webSocket: client });
+    }
+}
+
+export default {
+    async fetch(request, env) {
+        const id = env.CHAT_ROOM.idFromName('global-room');
+        return env.CHAT_ROOM.get(id).fetch(request);
     }
 };
