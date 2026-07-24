@@ -1,0 +1,11 @@
+{
+  "name": "Jason Chat",
+  "short_name": "Jason Chat",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#F8F9FF",
+  "theme_color": "#246BFD",
+  "description": "Flutter client for the Cloudflare WebSocket chat service",
+  "orientation": "portrait-primary",
+  "prefer_related_applications": false
+}

@@ -2,6 +2,16 @@
 
 这是一个基于 Cloudflare Workers、Durable Objects 和 D1 的点对点聊天服务，支持在线消息、离线消息和送达回执。
 
+## Flutter 前端
+
+响应式 Flutter Web 客户端位于 [`flutter_client`](flutter_client)，支持用户名注册、私聊、在线群聊、接收消息、回执、心跳、断线重连和自动选端口的一键启动包。
+
+```powershell
+cd flutter_client
+flutter pub get
+flutter run -d chrome
+```
+
 ## 终端客户端
 
 要求 Node.js 22 或更高版本，无需安装第三方依赖。
@@ -40,21 +50,10 @@ npm test
 
 ## 部署
 
-确认 `wrangler.toml` 中的 D1 数据库属于当前 Cloudflare 账户，并确保数据库已创建以下两张表：
+确认 `wrangler.toml` 中的 D1 数据库属于当前 Cloudflare 账户。服务端会在首次使用离线消息时自动创建表，也可在部署前主动执行迁移：
 
-```sql
-CREATE TABLE IF NOT EXISTS offline_msgs (
-    receiver TEXT NOT NULL,
-    sender TEXT NOT NULL,
-    content TEXT NOT NULL,
-    msg_id TEXT PRIMARY KEY
-);
-
-CREATE TABLE IF NOT EXISTS receipt_queue (
-    sender TEXT NOT NULL,
-    msg_id TEXT NOT NULL,
-    receiver TEXT NOT NULL
-);
+```powershell
+npx wrangler d1 migrations apply chat_db --remote
 ```
 
 然后部署：
