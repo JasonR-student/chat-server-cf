@@ -1,4 +1,4 @@
-name = "chat-server"
+name = "chat-server-cf"
 main = "src/worker.js"
 compatibility_date = "2026-07-24"
 
